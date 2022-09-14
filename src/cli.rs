@@ -87,6 +87,7 @@ pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, ()> {
 		Some("testnet") => Network::Testnet,
 		Some("regtest") => Network::Regtest,
 		Some("signet") => Network::Signet,
+		Some("bitcoin") => Network::Bitcoin,
 		Some(net) => {
 			panic!("Unsupported network provided. Options are: `regtest`, `testnet`, and `signet`. Got {}", net);
 		}
