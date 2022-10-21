@@ -13,7 +13,7 @@ use lightning::ln::msgs::NetAddress;
 use lightning::ln::{PaymentHash, PaymentPreimage};
 use lightning::onion_message::Destination;
 use lightning::routing::gossip::NodeId;
-use lightning::util::config::{ChannelHandshakeConfig, ChannelHandshakeLimits, UserConfig};
+use lightning::util::config::{ChannelHandshakeConfig, ChannelHandshakeLimits, UserConfig, ChannelConfig};
 use lightning::util::events::EventHandler;
 use lightning_invoice::payment::PaymentError;
 use lightning_invoice::{utils, Currency, Invoice};
@@ -166,9 +166,14 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
 				"openchannel" => {
 					let peer_pubkey_and_ip_addr = words.next();
 					let channel_value_sat = words.next();
-					if peer_pubkey_and_ip_addr.is_none() || channel_value_sat.is_none() {
-						println!("ERROR: openchannel has 2 required arguments: `openchannel pubkey@host:port channel_amt_satoshis` [--public]");
-						continue;
+					let chan_fee_base_msat = words.next();
+					let chan_fee_proportional_millionths = words.next();
+					if  peer_pubkey_and_ip_addr.is_none() ||
+						channel_value_sat.is_none() ||
+						chan_fee_base_msat.is_none() ||
+						chan_fee_proportional_millionths.is_none() {
+							println!("ERROR: usage `openchannel pubkey@host:port channel_amt_satoshis fee_base_msat fee_ppm_msat` [--public]");
+							continue;
 					}
 					let peer_pubkey_and_ip_addr = peer_pubkey_and_ip_addr.unwrap();
 					let (pubkey, peer_addr) =
@@ -181,10 +186,21 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
 						};
 
 					let chan_amt_sat: Result<u64, _> = channel_value_sat.unwrap().parse();
-					if chan_amt_sat.is_err() {
-						println!("ERROR: channel amount must be a number");
-						continue;
+					let chan_fee_base_msat: Result<u32, _> = chan_fee_base_msat.unwrap().parse();
+					let chan_fee_proportional_millionths: Result<u32, _> = chan_fee_proportional_millionths.unwrap().parse();
+					if  chan_amt_sat.is_err() ||
+						chan_fee_base_msat.is_err() ||
+						chan_fee_proportional_millionths.is_err() {
+							println!("ERROR: channel amount, base fee, and proportional fee must all be numbers");
+							continue;
 					}
+
+					// TODO: there's other configurable stuff we might want to configure
+					let channel_config = ChannelConfig {
+						forwarding_fee_base_msat: chan_fee_base_msat.unwrap(),
+						forwarding_fee_proportional_millionths: chan_fee_proportional_millionths.unwrap(),
+						..Default::default()
+					};
 
 					if connect_peer_if_necessary(pubkey, peer_addr, peer_manager.clone())
 						.await
@@ -208,9 +224,11 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
 						chan_amt_sat.unwrap(),
 						announce_channel,
 						channel_manager.clone(),
+						channel_config.clone(),
 					)
 					.is_ok()
 					{
+						// todo: maybe do the persist not inside the cli parsing loop
 						let peer_data_path = format!("{}/channel_peer_data", ldk_data_dir.clone());
 						let _ = disk::persist_channel_peer(
 							Path::new(&peer_data_path),
@@ -329,6 +347,56 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
 				"listchannels" => list_channels(&channel_manager, &network_graph),
 				"listpayments" => {
 					list_payments(inbound_payments.clone(), outbound_payments.clone())
+				}
+				"updatechannel" => {
+					let channel_id_str = words.next();
+					let peer_pubkey_str = words.next();
+					let chan_fee_base_msat = words.next();
+					let chan_fee_proportional_millionths = words.next();
+					if  channel_id_str.is_none() ||
+						peer_pubkey_str.is_none() ||
+						chan_fee_base_msat.is_none() ||
+						chan_fee_proportional_millionths.is_none() {
+							println!("ERROR: usage: `updatechannel <channel_id> <peer_pubkey> <forwarding_fee_base_msat> <forwarding_fee_proportional_millionths>`");
+							continue;
+					}
+					let chan_fee_base_msat: Result<u32, _> = chan_fee_base_msat.unwrap().parse();
+					let chan_fee_proportional_millionths: Result<u32, _> = chan_fee_proportional_millionths.unwrap().parse();
+					if  chan_fee_base_msat.is_err() ||
+						chan_fee_proportional_millionths.is_err() {
+							println!("ERROR: base fee and proportional fee must all be numbers");
+							continue;
+					}
+
+					let channel_id_vec = hex_utils::to_vec(channel_id_str.unwrap());
+					if channel_id_vec.is_none() || channel_id_vec.as_ref().unwrap().len() != 32 {
+						println!("ERROR: couldn't parse channel_id");
+						continue;
+					}
+					let mut channel_id = [0; 32];
+					channel_id.copy_from_slice(&channel_id_vec.unwrap());
+					let peer_pubkey_vec = match hex_utils::to_vec(peer_pubkey_str.unwrap()) {
+						Some(peer_pubkey_vec) => peer_pubkey_vec,
+						None => {
+							println!("ERROR: couldn't parse peer_pubkey");
+							continue;
+						}
+					};
+					let peer_pubkey = match PublicKey::from_slice(&peer_pubkey_vec) {
+						Ok(peer_pubkey) => peer_pubkey,
+						Err(_) => {
+							println!("ERROR: couldn't parse peer_pubkey");
+							continue;
+						}
+					};
+
+					update_channel(
+						channel_id,
+						peer_pubkey,
+						chan_fee_base_msat.unwrap(),
+						chan_fee_proportional_millionths.unwrap(),
+						channel_manager.clone()
+					)
 				}
 				"closechannel" => {
 					let channel_id_str = words.next();
@@ -625,9 +693,32 @@ pub(crate) async fn do_connect_peer(
 	}
 }
 
+fn update_channel(
+	channel_id: [u8; 32],
+	counterparty_node_id: PublicKey,
+	forwarding_fee_base_msat: u32,
+	forwarding_fee_proportional_millionths: u32,
+	channel_manager: Arc<ChannelManager>,
+) {
+	let channel_config = ChannelConfig {
+		forwarding_fee_base_msat,
+		forwarding_fee_proportional_millionths,
+		..Default::default()
+	};
+	let channel_ids = [channel_id];
+	match channel_manager.update_channel_config(
+		&counterparty_node_id,
+		&channel_ids,
+		&channel_config
+	) {
+		Ok(()) => println!("EVENT: forwarding policy updated"),
+		Err(e) => println!("ERROR: fwd policy update failed: {:?}", e),
+	}
+}
+
 fn open_channel(
 	peer_pubkey: PublicKey, channel_amt_sat: u64, announced_channel: bool,
-	channel_manager: Arc<ChannelManager>,
+	channel_manager: Arc<ChannelManager>, channel_config: ChannelConfig
 ) -> Result<(), ()> {
 	let config = UserConfig {
 		channel_handshake_limits: ChannelHandshakeLimits {
@@ -639,6 +730,7 @@ fn open_channel(
 			announced_channel,
 			..Default::default()
 		},
+		channel_config,
 		..Default::default()
 	};
 
