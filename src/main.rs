@@ -24,6 +24,7 @@ use lightning::ln::channelmanager::{
 };
 use lightning::ln::peer_handler::{IgnoringMessageHandler, MessageHandler, SimpleArcPeerManager};
 use lightning::ln::{PaymentHash, PaymentPreimage, PaymentSecret};
+use lightning::onion_message::SimpleArcOnionMessenger;
 use lightning::routing::gossip;
 use lightning::routing::gossip::{NodeId, P2PGossipSync};
 use lightning::routing::scoring::ProbabilisticScorer;
@@ -47,7 +48,6 @@ use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::Write;
-use std::ops::Deref;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -111,6 +111,8 @@ pub(crate) type InvoicePayer<E> = payment::InvoicePayer<
 type Router = DefaultRouter<Arc<NetworkGraph>, Arc<FilesystemLogger>>;
 
 pub(crate) type NetworkGraph = gossip::NetworkGraph<Arc<FilesystemLogger>>;
+
+type OnionMessenger = SimpleArcOnionMessenger<FilesystemLogger>;
 
 async fn handle_ldk_events(
 	channel_manager: &Arc<ChannelManager>, bitcoind_client: &BitcoindClient,
@@ -506,8 +508,10 @@ async fn start_ldk() {
 	let mut cache = UnboundedCache::new();
 	let mut chain_tip: Option<poll::ValidatedBlockHeader> = None;
 	if restarting_node {
-		let mut chain_listeners =
-			vec![(channel_manager_blockhash, &channel_manager as &dyn chain::Listen)];
+		let mut chain_listeners = vec![(
+			channel_manager_blockhash,
+			&channel_manager as &(dyn chain::Listen + Send + Sync),
+		)];
 
 		for (blockhash, channel_monitor) in channelmonitors.drain(..) {
 			let outpoint = channel_monitor.get_funding_txo().0;
@@ -519,12 +523,14 @@ async fn start_ldk() {
 		}
 
 		for monitor_listener_info in chain_listener_channel_monitors.iter_mut() {
-			chain_listeners
-				.push((monitor_listener_info.0, &monitor_listener_info.1 as &dyn chain::Listen));
+			chain_listeners.push((
+				monitor_listener_info.0,
+				&monitor_listener_info.1 as &(dyn chain::Listen + Send + Sync),
+			));
 		}
 		chain_tip = Some(
 			init::synchronize_listeners(
-				&mut bitcoind_client.deref(),
+				bitcoind_client.as_ref(),
 				args.network,
 				&mut cache,
 				chain_listeners,
@@ -554,18 +560,23 @@ async fn start_ldk() {
 
 	// Step 12: Initialize the PeerManager
 	let channel_manager: Arc<ChannelManager> = Arc::new(channel_manager);
+	let onion_messenger: Arc<OnionMessenger> =
+		Arc::new(OnionMessenger::new(keys_manager.clone(), logger.clone()));
 	let mut ephemeral_bytes = [0; 32];
+	let current_time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
 	rand::thread_rng().fill_bytes(&mut ephemeral_bytes);
 	let lightning_msg_handler = MessageHandler {
 		chan_handler: channel_manager.clone(),
 		route_handler: gossip_sync.clone(),
+		onion_message_handler: onion_messenger.clone(),
 	};
 	let peer_manager: Arc<PeerManager> = Arc::new(PeerManager::new(
 		lightning_msg_handler,
 		keys_manager.get_node_secret(Recipient::Node).unwrap(),
+		current_time,
 		&ephemeral_bytes,
 		logger.clone(),
-		Arc::new(IgnoringMessageHandler {}),
+		IgnoringMessageHandler {},
 	));
 
 	// ## Running LDK
@@ -597,16 +608,14 @@ async fn start_ldk() {
 
 	// Step 14: Connect and Disconnect Blocks
 	if chain_tip.is_none() {
-		chain_tip =
-			Some(init::validate_best_block_header(&mut bitcoind_client.deref()).await.unwrap());
+		chain_tip = Some(init::validate_best_block_header(bitcoind_client.as_ref()).await.unwrap());
 	}
 	let channel_manager_listener = channel_manager.clone();
 	let chain_monitor_listener = chain_monitor.clone();
 	let bitcoind_block_source = bitcoind_client.clone();
 	let network = args.network;
 	tokio::spawn(async move {
-		let mut derefed = bitcoind_block_source.deref();
-		let chain_poller = poll::ChainPoller::new(&mut derefed, network);
+		let chain_poller = poll::ChainPoller::new(bitcoind_block_source.as_ref(), network);
 		let chain_listener = (chain_monitor_listener, channel_manager_listener);
 		let mut spv_client =
 			SpvClient::new(chain_tip.unwrap(), chain_poller, &mut cache, &chain_listener);
@@ -721,14 +730,14 @@ async fn start_ldk() {
 	// some public channels, and is only useful if we have public listen address(es) to announce.
 	// In a production environment, this should occur only after the announcement of new channels
 	// to avoid churn in the global network graph.
-	let chan_manager = Arc::clone(&channel_manager);
+	let peer_man = Arc::clone(&peer_manager);
 	let network = args.network;
 	if !args.ldk_announced_listen_addr.is_empty() {
 		tokio::spawn(async move {
 			let mut interval = tokio::time::interval(Duration::from_secs(60));
 			loop {
 				interval.tick().await;
-				chan_manager.broadcast_node_announcement(
+				peer_man.broadcast_node_announcement(
 					[0; 3],
 					args.ldk_announced_node_name,
 					args.ldk_announced_listen_addr.clone(),
@@ -744,6 +753,7 @@ async fn start_ldk() {
 		Arc::clone(&channel_manager),
 		Arc::clone(&keys_manager),
 		Arc::clone(&network_graph),
+		Arc::clone(&onion_messenger),
 		inbound_payments,
 		outbound_payments,
 		ldk_data_dir.clone(),

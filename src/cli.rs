@@ -1,8 +1,8 @@
 use crate::disk;
 use crate::hex_utils;
 use crate::{
-	ChannelManager, HTLCStatus, InvoicePayer, MillisatAmount, NetworkGraph, PaymentInfo,
-	PaymentInfoStorage, PeerManager,
+	ChannelManager, HTLCStatus, InvoicePayer, MillisatAmount, NetworkGraph, OnionMessenger,
+	PaymentInfo, PaymentInfoStorage, PeerManager,
 };
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
@@ -11,6 +11,7 @@ use bitcoin::secp256k1::PublicKey;
 use lightning::chain::keysinterface::{KeysInterface, KeysManager, Recipient};
 use lightning::ln::msgs::NetAddress;
 use lightning::ln::{PaymentHash, PaymentPreimage};
+use lightning::onion_message::Destination;
 use lightning::routing::gossip::NodeId;
 use lightning::util::config::{ChannelHandshakeConfig, ChannelHandshakeLimits, UserConfig};
 use lightning::util::events::EventHandler;
@@ -18,7 +19,7 @@ use lightning_invoice::payment::PaymentError;
 use lightning_invoice::{utils, Currency, Invoice};
 use std::env;
 use std::io;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::ops::Deref;
 use std::path::Path;
@@ -143,21 +144,21 @@ pub(crate) fn parse_startup_args() -> Result<LdkUserInfo, ()> {
 pub(crate) async fn poll_for_user_input<E: EventHandler>(
 	invoice_payer: Arc<InvoicePayer<E>>, peer_manager: Arc<PeerManager>,
 	channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
-	network_graph: Arc<NetworkGraph>, inbound_payments: PaymentInfoStorage,
-	outbound_payments: PaymentInfoStorage, ldk_data_dir: String, network: Network,
+	network_graph: Arc<NetworkGraph>, onion_messenger: Arc<OnionMessenger>,
+	inbound_payments: PaymentInfoStorage, outbound_payments: PaymentInfoStorage,
+	ldk_data_dir: String, network: Network,
 ) {
 	println!("LDK startup successful. To view available commands: \"help\".");
 	println!("LDK logs are available at <your-supplied-ldk-data-dir-path>/.ldk/logs");
 	println!("Local Node ID is {}.", channel_manager.get_our_node_id());
-	let stdin = io::stdin();
-	let mut line_reader = stdin.lock().lines();
 	loop {
 		print!("> ");
 		io::stdout().flush().unwrap(); // Without flushing, the `>` doesn't print
-		let line = match line_reader.next() {
-			Some(l) => l.unwrap(),
-			None => break,
-		};
+		let mut line = String::new();
+		if let Err(e) = io::stdin().read_line(&mut line) {
+			break println!("ERROR: {e:#}");
+		}
+
 		let mut words = line.split_whitespace();
 		if let Some(word) = words.next() {
 			match word {
@@ -417,6 +418,48 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
 						)
 					);
 				}
+				"sendonionmessage" => {
+					let path_pks_str = words.next();
+					if path_pks_str.is_none() {
+						println!(
+							"ERROR: sendonionmessage requires at least one node id for the path"
+						);
+						continue;
+					}
+					let mut node_pks = Vec::new();
+					let mut errored = false;
+					for pk_str in path_pks_str.unwrap().split(",") {
+						let node_pubkey_vec = match hex_utils::to_vec(pk_str) {
+							Some(peer_pubkey_vec) => peer_pubkey_vec,
+							None => {
+								println!("ERROR: couldn't parse peer_pubkey");
+								errored = true;
+								break;
+							}
+						};
+						let node_pubkey = match PublicKey::from_slice(&node_pubkey_vec) {
+							Ok(peer_pubkey) => peer_pubkey,
+							Err(_) => {
+								println!("ERROR: couldn't parse peer_pubkey");
+								errored = true;
+								break;
+							}
+						};
+						node_pks.push(node_pubkey);
+					}
+					if errored {
+						continue;
+					}
+					let destination_pk = node_pks.pop().unwrap();
+					match onion_messenger.send_onion_message(
+						&node_pks,
+						Destination::Node(destination_pk),
+						None,
+					) {
+						Ok(()) => println!("SUCCESS: forwarded onion message to first hop"),
+						Err(e) => println!("ERROR: failed to send onion message: {:?}", e),
+					}
+				}
 				_ => println!("Unknown command. See `\"help\" for available commands."),
 			}
 		}
@@ -436,6 +479,7 @@ fn help() {
 	println!("nodeinfo");
 	println!("listpeers");
 	println!("signmessage <message>");
+	println!("sendonionmessage <node_id_1,node_id_2,..,destination_node_id>");
 }
 
 fn node_info(channel_manager: &Arc<ChannelManager>, peer_manager: &Arc<PeerManager>) {
@@ -763,7 +807,7 @@ pub(crate) fn parse_peer_info(
 	let mut pubkey_and_addr = peer_pubkey_and_ip_addr.split("@");
 	let pubkey = pubkey_and_addr.next();
 	let peer_addr_str = pubkey_and_addr.next();
-	if peer_addr_str.is_none() || peer_addr_str.is_none() {
+	if peer_addr_str.is_none() {
 		return Err(std::io::Error::new(
 			std::io::ErrorKind::Other,
 			"ERROR: incorrectly formatted peer info. Should be formatted as: `pubkey@host:port`",
