@@ -193,6 +193,7 @@ macro_rules! sure_write {
  */
 async fn handle_one_user_input<E: EventHandler>(
 	user_input: String, output_buffer: &mut Vec<u8>,
+	quit: &mut bool,
 	invoice_payer: Arc<InvoicePayer<E>>, peer_manager: Arc<PeerManager>,
 	channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
 	network_graph: Arc<NetworkGraph>, onion_messenger: Arc<OnionMessenger>,
@@ -205,6 +206,7 @@ async fn handle_one_user_input<E: EventHandler>(
 	let mut words = line.split_whitespace();
 	if let Some(word) = words.next() {
 		match word {
+			"quit" => { *quit = true; return; }
 			"help" => help(out),
 			"openchannel" => {
 				let peer_pubkey_and_ip_addr = words.next();
@@ -591,6 +593,8 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
 	println!("LDK startup successful. To view available commands: \"help\".");
 	println!("LDK logs are available at <your-supplied-ldk-data-dir-path>/.ldk/logs");
 	println!("Local Node ID is {}.", channel_manager.get_our_node_id());
+	let mut quit_flag = false;
+
 	loop {
 		print!("> ");
 		io::stdout().flush().unwrap(); // Without flushing, the `>` doesn't print
@@ -606,6 +610,7 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
 		/* Process that command.  */
 		handle_one_user_input::<E>(
 			line, &mut output_buffer,
+			&mut quit_flag,
 			invoice_payer.clone(), peer_manager.clone(),
 			channel_manager.clone(), keys_manager.clone(),
 			network_graph.clone(), onion_messenger.clone(),
@@ -619,6 +624,11 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
 
 		/* Return the output to user.  */
 		print!("{}", output_string);
+
+		/* Did we quit?  */
+		if quit_flag {
+			break;
+		}
 	}
 }
 
@@ -635,6 +645,7 @@ fn help(out: &mut Vec<u8>) {
 	sure_writeln!(out, "nodeinfo");
 	sure_writeln!(out, "listpeers");
 	sure_writeln!(out, "signmessage <message>");
+	sure_writeln!(out, "quit");
 }
 
 fn node_info(
