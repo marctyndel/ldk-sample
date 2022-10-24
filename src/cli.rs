@@ -11,10 +11,15 @@ use bitcoin::secp256k1::PublicKey;
 use lightning::chain::keysinterface::{KeysInterface, KeysManager, Recipient};
 use lightning::ln::msgs::NetAddress;
 use lightning::ln::{PaymentHash, PaymentPreimage};
+use lightning::log_error;
+use lightning::log_given_level;
+use lightning::log_info;
+use lightning::log_internal;
 use lightning::onion_message::Destination;
 use lightning::routing::gossip::NodeId;
 use lightning::util::config::{ChannelHandshakeConfig, ChannelHandshakeLimits, UserConfig, ChannelConfig};
 use lightning::util::events::EventHandler;
+use lightning::util::logger::Logger;
 use lightning_invoice::payment::PaymentError;
 use lightning_invoice::{utils, Currency, Invoice};
 use std::env;
@@ -26,6 +31,8 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::UnixListener;
+use tokio::net::UnixStream;
 
 pub(crate) struct LdkUserInfo {
 	pub(crate) bitcoind_rpc_username: String,
@@ -583,29 +590,116 @@ async fn handle_one_user_input<E: EventHandler>(
 
 }
 
-pub(crate) async fn poll_for_user_input<E: EventHandler>(
+/** read_line_from_socket
+ *
+ * @brief read a single line from the given socket,
+ * returning a string.
+ */
+async fn read_line_from_socket(socket: &UnixStream) -> Result<String, io::Error> {
+	let mut total_data = Vec::<u8>::new();
+	let mut exit = false;
+	loop {
+		let mut data = vec![0; 1024];
+		socket.readable().await?;
+
+		match socket.try_read(&mut data) {
+			Ok(0) => { break; }
+			Ok(n) => {
+				data.truncate(n);
+				for c in data.iter() {
+					if *c == 10 || *c == 13 {
+						exit = true;
+						break;
+					}
+					total_data.push(*c);
+				}
+			}
+			Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+				continue;
+			}
+			Err(e) => {
+				return Err(e);
+			}
+		}
+
+		if exit {
+			break;
+		}
+	}
+	return match String::from_utf8(total_data) {
+		Ok(s) => { Ok(s) }
+		Err(_) => { Err(io::Error::from(io::ErrorKind::InvalidData)) }
+	}
+}
+
+/** write_buf_to_socket
+ *
+ * @brief write the buffer to the socket completely.
+ */
+async fn write_buf_to_socket(socket: &UnixStream, buf: &Vec<u8>) -> Result<(), io::Error> {
+	let mut start = 0;
+	while start < buf.len() {
+		socket.writable().await?;
+		match socket.try_write(&buf[start..]) {
+			Ok(n) => {
+				start += n;
+			}
+			Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+				continue;
+			}
+			Err(e) => {
+				return Err(e);
+			}
+		}
+	}
+	return Ok(());
+}
+
+pub(crate) async fn poll_for_user_input<E: EventHandler, L: Logger>(
+	logger: Arc<L>,
 	invoice_payer: Arc<InvoicePayer<E>>, peer_manager: Arc<PeerManager>,
 	channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
 	network_graph: Arc<NetworkGraph>, onion_messenger: Arc<OnionMessenger>,
 	inbound_payments: PaymentInfoStorage, outbound_payments: PaymentInfoStorage,
 	ldk_data_dir: String, network: Network,
 ) {
-	println!("LDK startup successful. To view available commands: \"help\".");
-	println!("LDK logs are available at <your-supplied-ldk-data-dir-path>/.ldk/logs");
-	println!("Local Node ID is {}.", channel_manager.get_our_node_id());
+	/* Use $HOME/awesome_rpc */
+	let home = env::var("HOME").unwrap();
+	let rpc_path = format!("{}/awesome_rpc", home);
+	let _ = std::fs::remove_file(rpc_path.clone()); // Ignore errors;
+	let listener = match UnixListener::bind(rpc_path) {
+		Ok(listener) => { listener }
+		Err(e) => {
+			log_error!(logger, "ERROR binding to $HOME/awesome_rpc: {}", e);
+			return;
+		}
+	};
+
+	log_info!(logger, "LDK startup successful. To view available commands: \"help\".");
+	log_info!(logger, "LDK logs are available at <your-supplied-ldk-data-dir-path>/.ldk/logs");
+	log_info!(logger, "Local Node ID is {}.", channel_manager.get_our_node_id());
+
 	let mut quit_flag = false;
 
 	loop {
-		print!("> ");
-		io::stdout().flush().unwrap(); // Without flushing, the `>` doesn't print
+		let socket = match listener.accept().await {
+			Ok((socket, _)) => { socket }
+			Err(e) => {
+				log_error!(logger, "Error accepting RPC connection: {}", e);
+				continue;
+			}
+		};
 
 		/* Get input from the user.  */
-		let mut line = String::new();
-		if let Err(e) = io::stdin().read_line(&mut line) {
-			break println!("ERROR: {e:#}");
-		}
-		let mut output_buffer = Vec::<u8>::new();
+		let line = match read_line_from_socket(&socket).await {
+			Ok(line) => { line }
+			Err(e) => {
+				log_error!(logger, "Error reading command from RPC connection: {}", e);
+				continue;
+			}
+		};
 
+		let mut output_buffer = Vec::<u8>::new();
 
 		/* Process that command.  */
 		handle_one_user_input::<E>(
@@ -617,13 +711,13 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
 			inbound_payments.clone(), outbound_payments.clone(),
 			ldk_data_dir.clone(), network
 		).await;
-		/* Extract the output.  Trust that the output buffer was
-		 * properly UTF8-encoded.
-		 */
-		let output_string = unsafe { String::from_utf8_unchecked(output_buffer) };
-
 		/* Return the output to user.  */
-		print!("{}", output_string);
+		match write_buf_to_socket(&socket, &output_buffer).await {
+			Ok(()) => { }
+			Err(e) => {
+				log_error!(logger, "Error writing result to RPC connection: {}", e);
+			}
+		}
 
 		/* Did we quit?  */
 		if quit_flag {
