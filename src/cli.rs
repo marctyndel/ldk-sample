@@ -11,10 +11,15 @@ use bitcoin::secp256k1::PublicKey;
 use lightning::chain::keysinterface::{KeysInterface, KeysManager, Recipient};
 use lightning::ln::msgs::NetAddress;
 use lightning::ln::{PaymentHash, PaymentPreimage};
+use lightning::log_error;
+use lightning::log_given_level;
+use lightning::log_info;
+use lightning::log_internal;
 use lightning::onion_message::Destination;
 use lightning::routing::gossip::NodeId;
 use lightning::util::config::{ChannelHandshakeConfig, ChannelHandshakeLimits, UserConfig, ChannelConfig};
 use lightning::util::events::EventHandler;
+use lightning::util::logger::Logger;
 use lightning_invoice::payment::PaymentError;
 use lightning_invoice::{utils, Currency, Invoice};
 use std::env;
@@ -650,7 +655,8 @@ async fn write_buf_to_socket(socket: &UnixStream, buf: &Vec<u8>) -> Result<(), i
 	return Ok(());
 }
 
-pub(crate) async fn poll_for_user_input<E: EventHandler>(
+pub(crate) async fn poll_for_user_input<E: EventHandler, L: Logger>(
+	logger: Arc<L>,
 	invoice_payer: Arc<InvoicePayer<E>>, peer_manager: Arc<PeerManager>,
 	channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
 	network_graph: Arc<NetworkGraph>, onion_messenger: Arc<OnionMessenger>,
@@ -664,14 +670,14 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
 	let listener = match UnixListener::bind(rpc_path) {
 		Ok(listener) => { listener }
 		Err(e) => {
-			println!("ERROR binding to $HOME/awesome_rpc: {}", e);
+			log_error!(logger, "ERROR binding to $HOME/awesome_rpc: {}", e);
 			return;
 		}
 	};
 
-	println!("LDK startup successful. To view available commands: \"help\".");
-	println!("LDK logs are available at <your-supplied-ldk-data-dir-path>/.ldk/logs");
-	println!("Local Node ID is {}.", channel_manager.get_our_node_id());
+	log_info!(logger, "LDK startup successful. To view available commands: \"help\".");
+	log_info!(logger, "LDK logs are available at <your-supplied-ldk-data-dir-path>/.ldk/logs");
+	log_info!(logger, "Local Node ID is {}.", channel_manager.get_our_node_id());
 
 	let mut quit_flag = false;
 
@@ -679,7 +685,7 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
 		let socket = match listener.accept().await {
 			Ok((socket, _)) => { socket }
 			Err(e) => {
-				println!("Error accepting RPC connection: {}", e);
+				log_error!(logger, "Error accepting RPC connection: {}", e);
 				continue;
 			}
 		};
@@ -688,7 +694,7 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
 		let line = match read_line_from_socket(&socket).await {
 			Ok(line) => { line }
 			Err(e) => {
-				println!("Error reading command from RPC connection: {}", e);
+				log_error!(logger, "Error reading command from RPC connection: {}", e);
 				continue;
 			}
 		};
@@ -709,7 +715,7 @@ pub(crate) async fn poll_for_user_input<E: EventHandler>(
 		match write_buf_to_socket(&socket, &output_buffer).await {
 			Ok(()) => { }
 			Err(e) => {
-				println!("Error writing result to RPC connection: {}", e);
+				log_error!(logger, "Error writing result to RPC connection: {}", e);
 			}
 		}
 

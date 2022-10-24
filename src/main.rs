@@ -748,6 +748,7 @@ async fn start_ldk() {
 
 	// Start the CLI.
 	cli::poll_for_user_input(
+		Arc::clone(&logger),
 		Arc::clone(&invoice_payer),
 		Arc::clone(&peer_manager),
 		Arc::clone(&channel_manager),
