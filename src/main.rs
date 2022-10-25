@@ -1,6 +1,7 @@
 pub mod bitcoind_client;
 mod cli;
 mod convert;
+mod daemonize;
 mod disk;
 mod hex_utils;
 
@@ -357,7 +358,7 @@ async fn handle_ldk_events(
 	}
 }
 
-async fn start_ldk() {
+async fn start_ldk(completer: daemonize::DaemonInitCompleter) {
 	let args = match cli::parse_startup_args() {
 		Ok(user_args) => user_args,
 		Err(()) => return,
@@ -748,6 +749,7 @@ async fn start_ldk() {
 
 	// Start the CLI.
 	cli::poll_for_user_input(
+		completer,
 		Arc::clone(&logger),
 		Arc::clone(&invoice_payer),
 		Arc::clone(&peer_manager),
@@ -771,7 +773,16 @@ async fn start_ldk() {
 	background_processor.stop().unwrap();
 }
 
-#[tokio::main]
-pub async fn main() {
-	start_ldk().await;
+fn awesome_main(completer: daemonize::DaemonInitCompleter) {
+	tokio::runtime::Builder::new_multi_thread()
+		.enable_all()
+		.build()
+		.unwrap()
+		.block_on(start_ldk(completer))
+}
+
+fn main() {
+	daemonize::daemonize(|completer| {
+		awesome_main(completer)
+	}).unwrap();
 }

@@ -1,3 +1,4 @@
+use crate::daemonize;
 use crate::disk;
 use crate::hex_utils;
 use crate::{
@@ -656,6 +657,7 @@ async fn write_buf_to_socket(socket: &UnixStream, buf: &Vec<u8>) -> Result<(), i
 }
 
 pub(crate) async fn poll_for_user_input<E: EventHandler, L: Logger>(
+	completer: daemonize::DaemonInitCompleter,
 	logger: Arc<L>,
 	invoice_payer: Arc<InvoicePayer<E>>, peer_manager: Arc<PeerManager>,
 	channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
@@ -678,6 +680,8 @@ pub(crate) async fn poll_for_user_input<E: EventHandler, L: Logger>(
 	log_info!(logger, "LDK startup successful. To view available commands: \"help\".");
 	log_info!(logger, "LDK logs are available at <your-supplied-ldk-data-dir-path>/.ldk/logs");
 	log_info!(logger, "Local Node ID is {}.", channel_manager.get_our_node_id());
+
+	completer.completed();
 
 	let mut quit_flag = false;
 
